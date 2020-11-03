@@ -35,6 +35,9 @@ Steps performed by the script:
 
 =========================================
 Version: 
+    12062019: Add Permissions Only switch to skip steps 2 & 3
+    08232019: AccountResourceEnv switch add 
+    05012019: Update cross domain check
 	06262018: Update group enumeration cross domain logic
     06122018: Update group enumeration logic
 
@@ -91,6 +94,9 @@ Make sure you have the permissions output file in the same directory (Find-Mailb
 .PARAMETER BatchUsersOnly
 Use this if you want to skip collecting permissions (step1) and creating a migration schedule (step 3). This won't require an active exchange session, but make sure you have the permissions output file in the same directory (Find-MailboxDelegates-Permissions.csv).
 
+.PARAMETER GetPermissionsOnly
+Use this switch to run Step 1 only (Get Permissions). This will skip steps 2&3 which does the spider web batching and creates a migration schedule. 
+
 .PARAMETER AccountResourceEnv
 Switch to run the script taking into account an Account/Resource environment
 
@@ -135,8 +141,8 @@ Switch to run the script taking into account an Account/Resource environment
 
 param(
     [string]$InputMailboxesCSV,
-    [switch]$FullAccess,
-    [switch]$SendOnBehalfTo,
+    [switch]$FullAccess = $true,
+    [switch]$SendOnBehalfTo = $true,
     [switch]$Calendar,
     [switch]$SendAs,
     [switch]$EnumerateGroups,
@@ -145,7 +151,9 @@ param(
     [string]$ExchServerFQDN,
     [switch]$Resume,
     [switch]$BatchUsers, 
-    [switch]$BatchUsersOnly
+    [switch]$BatchUsersOnly,
+    [switch]$GetPermissionsOnly, 
+    [switch]$AccountResourceEnv
 )
 
 Begin{
@@ -212,6 +220,34 @@ Begin{
             return $del
         }
 
+        Function Get-GroupCustom{
+            param(
+                [string]$Identity
+            )
+            $error.Clear()
+            try
+            { 
+                #$del=Get-Group -Identity $group -ErrorAction stop
+                $group = Get-Group -identity $Identity -ErrorAction SilentlyContinue
+            }
+            catch 
+            {
+                if ( $error[0].Exception.ToString() -like "*The operation couldn't be performed because object*couldn't be found on*")
+                {
+                    $domain = $Identity.split("\")[0]
+                    $remoteDC = Get-ADDomainController -discover -domain $domain 
+                    try{
+                        $group = get-group -identity $Identity -DomainController $remoteDC.hostname -erroraction silentlyContinue
+                        return $group
+                    }
+                    catch{
+                        return $null
+                    }
+                }
+            }
+            return $group
+        }
+
         Function Get-Permissions(){
 	            param(
                     [string]$UserEmail,
@@ -236,19 +272,6 @@ Begin{
                         throw "Problem getting mailbox for $($UserEmail) : $($error)" 
                     }
 
-                    #Enumerate Groups/Send As - moving this part outside of the function for faster processing
-                    <#
-                    If(($EnumerateGroups -eq $true) -or ($gathersendas -eq $true)){
-                        $dse = [ADSI]"LDAP://Rootdse"
-                        $ext = [ADSI]("LDAP://CN=Extended-Rights," + $dse.ConfigurationNamingContext)
-                        $dn = [ADSI]"LDAP://$($dse.DefaultNamingContext)"
-                        $dsLookFor = new-object System.DirectoryServices.DirectorySearcher($dn)
-
-                        $permission = "Send As"
-                        $right = $ext.psbase.Children | ? { $_.DisplayName -eq $permission }
-                    }
-                    #>
-            
                     If($gathercalendar -eq $true){
                         $Error.Clear()
 	                    $CalendarPermission = Get-MailboxFolderPermission -Identity ($Mailbox.alias + ':\Calendar') -WarningAction SilentlyContinue -ErrorAction SilentlyContinue | ?{$_.User -notlike "Anonymous" -and $_.User -notlike "Default"} | Select User, AccessRights
@@ -259,14 +282,15 @@ Begin{
             
                         If($CalendarPermission){
                             Foreach($perm in $CalendarPermission){
-                                $ifGroup = Get-Group -identity $perm.user.tostring() -ErrorAction SilentlyContinue
+                                #$ifGroup = Get-Group -identity $perm.user.tostring() -ErrorAction SilentlyContinue
+                                $ifGroup = Get-GroupCustom -identity $perm.user.tostring() -ErrorAction SilentlyContinue
                                 If($ifGroup){
                                     If($EnumerateGroups -eq $true){
 				                        If(-not ($excludedGroups -contains $ifGroup.Name)){
-                                            $groupDomainName = $ifgroup.Identity | select DomainId
-                                            $groupDomainName = $groupDomainName.domainid.tostring()
+                                            $groupDomainName = $ifgroup.identity.tostring().split("/")[0]
                                             Write-LogEntry -LogName:$Script:LogFile -LogEntryText "Found permission : Calendar : Enumerate Group $($ifGroup.distinguishedName) Domain Name: $groupDomainName"
-                                            $lstUsr = Get-AdGroup -identity $ifGroup.Name -Server $groupDomainName | Get-ADGroupMember -Recursive | Get-ADUser -Properties Mail
+                                            #$lstUsr = Get-AdGroup -identity $ifGroup.Name -Server $groupDomainName | Get-ADGroupMember -Recursive | Get-ADUser -Properties Mail
+                                            $lstUsr = Get-ADGroupMember -identity $ifGroup.distinguishedName -server $groupDomainName -Recursive | Get-ADUser -Properties Mail | ?{$_.Mail}
 
 	                                        foreach ($usrTmp in $lstUsr) {
                                                 $usrTmpEmail = $usrTmp.Mail
@@ -313,18 +337,19 @@ Begin{
 
                     If($gatherfullaccess -eq $true){
                         $Error.Clear()
-                        $FullAccessPermissions = Get-MailboxPermission -Identity ($Mailbox.PrimarySMTPAddress).tostring() | ? {($_.AccessRights -like “*FullAccess*”) -and ($_.IsInherited -eq $false) -and ($_.User -notlike “NT AUTHORITY\SELF”) -and ($_.User -notlike "S-1-5*") -and ($_.User -notlike $Mailbox.PrimarySMTPAddress)}
+                        $FullAccessPermissions = Get-MailboxPermission -Identity ($Mailbox.PrimarySMTPAddress).tostring() | ? {($_.AccessRights -like "*FullAccess*") -and ($_.IsInherited -eq $false) -and ($_.User -notlike "NT AUTHORITY\SELF") -and ($_.User -notlike "S-1-5*") -and ($_.User -notlike $Mailbox.PrimarySMTPAddress)}
                 
                         If($FullAccessPermissions){
                             Foreach($perm in $FullAccessPermissions){
-                                $ifGroup = Get-Group -identity $perm.user.tostring() -ErrorAction SilentlyContinue 
+                                #$ifGroup = Get-Group -identity $perm.user.tostring() -ErrorAction SilentlyContinue 
+                                $ifGroup = Get-GroupCustom -identity $perm.user.tostring() -ErrorAction SilentlyContinue
                                 If($ifGroup){
                                     If($EnumerateGroups -eq $true){
 				                        If(-not ($excludedGroups -contains $ifGroup.Name)){
-                                            $groupDomainName = $ifgroup.Identity | select DomainId
-                                            $groupDomainName = $groupDomainName.domainid.tostring()
+                                            $groupDomainName = $ifgroup.identity.tostring().split("/")[0]
                                             Write-LogEntry -LogName:$Script:LogFile -LogEntryText "Found permission : FullAccess : Enumerate Group $($ifGroup.distinguishedName) Domain Name: $groupDomainName"
-                                            $lstUsr = Get-AdGroup -identity $ifGroup.Name -Server $groupDomainName | Get-ADGroupMember -Recursive | Get-ADUser -Properties Mail
+                                            #$lstUsr = Get-AdGroup -identity $ifGroup.distinguishedName | Get-ADGroupMember -Recursive | Get-ADUser -Properties Mail $globalCatalog
+                                            $lstUsr = Get-ADGroupMember -identity $ifGroup.distinguishedName -server $groupDomainName -Recursive | Get-ADUser -Properties Mail | ?{$_.Mail}
 
 	                                        foreach ($usrTmp in $lstUsr) {
                                                 $usrTmpEmail = $usrTmp.Mail
@@ -371,27 +396,18 @@ Begin{
 
                     If($gathersendas -eq $true){
                         $Error.Clear()
-                        #$SendAsPermissions = Get-ADPermission $Mailbox.DistinguishedName | ?{($_.ExtendedRights -like "*send-as*") -and ($_.IsInherited -eq $false) -and -not ($_.User -like "NT AUTHORITY\SELF") }
-                
-                        $SendAsPermissions = New-Object System.Collections.Generic.List[System.Object] 
-                        $userDN = [ADSI]("LDAP://$($mailbox.DistinguishedName)")
-                        $userDN.psbase.ObjectSecurity.Access | ? { ($_.ObjectType -eq [GUID]$right.RightsGuid.Value) -and ($_.IsInherited -eq $false) } | select -ExpandProperty identityreference | %{
-				            If(-not ($_ -like "NT AUTHORITY\SELF")){
-					            $SendAsPermissions.add($_)
-				            }
-			            }
-                
-
+                        $SendAsPermissions = Get-RecipientPermission $Mailbox.DistinguishedName | ?{($_.AccessRights -like "*SendAs*") -and ($_.IsInherited -eq $false) -and -not ($_.Trustee -like "NT AUTHORITY\SELF") }
                         If($SendAsPermissions){
                             Foreach($perm in $SendAsPermissions){
-                                $ifGroup = Get-Group -identity $perm.tostring() -ErrorAction SilentlyContinue
+                                #$ifGroup = Get-Group -identity $perm.tostring() -ErrorAction SilentlyContinue
+                                $ifGroup = Get-GroupCustom -identity $perm.tostring() -ErrorAction SilentlyContinue
                                 If($ifGroup){
                                     If($EnumerateGroups -eq $true){
 				                        If(-not ($ExcludedGroups -contains $ifGroup.Name)){
-                                            $groupDomainName = $ifgroup.Identity | select DomainId
-                                            $groupDomainName = $groupDomainName.domainid.tostring()
+                                            $groupDomainName = $ifgroup.identity.tostring().split("/")[0]
                                             Write-LogEntry -LogName:$Script:LogFile -LogEntryText "Found permission : SendAs : Enumerate Group $($ifGroup.distinguishedName) Domain Name: $groupDomainName"
-                                            $lstUsr = Get-AdGroup -identity $ifGroup.Name -Server $groupDomainName | Get-ADGroupMember -Recursive | Get-ADUser -Properties Mail
+                                            #$lstUsr = Get-AdGroup -identity $ifGroup.distinguishedName -Server $groupDomainName | Get-ADGroupMember -Recursive | Get-ADUser -Properties Mail -server $globalCatalog
+                                            $lstUsr = Get-ADGroupMember -identity $ifGroup.distinguishedName -server $groupDomainName -Recursive | Get-ADUser -Properties Mail | ?{$_.Mail}
 
 	                                        foreach ($usrTmp in $lstUsr) {
                                                 $usrTmpEmail = $usrTmp.Mail
@@ -411,7 +427,7 @@ Begin{
                                 }
                                 Else{
                                     #$delegate = Get-Recipient -Identity $perm.tostring() -ErrorAction SilentlyContinue
-                                    $delegate = Get-RecipientCustom $perm.tostring()
+                                    $delegate = Get-RecipientCustom $perm.Trustee.ToString()
                         
                                     If($mailbox.primarySMTPAddress -and $delegate.primarySMTPAddress){
 							            If(-not ($mailbox.primarySMTPAddress.ToString() -eq $delegate.primarySMTPAddress.ToString())){
@@ -444,18 +460,20 @@ Begin{
                             Foreach($perm in $GrantSendOnBehalfToPermissions){
                                 #$delegate = Get-Recipient -Identity $perm.tostring() -ErrorAction SilentlyContinue
                                 $delegate = Get-RecipientCustom $perm.tostring()
-                        
-                                If($mailbox.primarySMTPAddress -and $delegate.primarySMTPAddress){
-							        If(-not ($mailbox.primarySMTPAddress.ToString() -eq $delegate.primarySMTPAddress.ToString())){
-                                        If($ExcludedServiceAccts){
-                                            if(-not ($ExcludedServiceAccts -contains $delegate.primarySMTPAddress.tostring() -or $ExcludedServiceAccts -contains $mailbox.primarySMTPAddress.ToString())){
-                                                Write-LogEntry -LogName:$Script:LogFile -LogEntryText "Found permission : SendOnBehalfTo : $($delegate.primarySMTPAddress.ToString())"
-                                                $CollectPermissions.add([pscustomobject]@{Mailbox = $Mailbox.PrimarySMTPAddress; User = $delegate.primarySMTPAddress.ToString(); AccessRights = "SendOnBehalfTo"})
+                                
+                                foreach ($deleg in $delegate){
+                                    If($mailbox.primarySMTPAddress -and $deleg.primarySMTPAddress -and $deleg.RecipientType -eq "UserMailbox"){
+                                        If(-not ($mailbox.primarySMTPAddress.ToString() -eq $deleg.primarySMTPAddress.ToString())){
+                                            If($ExcludedServiceAccts){
+                                                if(-not ($ExcludedServiceAccts -contains $deleg.primarySMTPAddress.tostring() -or $ExcludedServiceAccts -contains $mailbox.primarySMTPAddress.ToString())){
+                                                    Write-LogEntry -LogName:$Script:LogFile -LogEntryText "Found permission : SendOnBehalfTo : $($deleg.primarySMTPAddress.ToString())"
+                                                    $CollectPermissions.add([pscustomobject]@{Mailbox = $Mailbox.PrimarySMTPAddress; User = $deleg.primarySMTPAddress.ToString(); AccessRights = "SendOnBehalfTo"})
+                                                }
                                             }
-                                        }
-                                        Else{
-                                            Write-LogEntry -LogName:$Script:LogFile -LogEntryText "Found permission : SendOnBehalfTo : $($delegate.primarySMTPAddress.ToString())"
-                                            $CollectPermissions.add([pscustomobject]@{Mailbox = $Mailbox.PrimarySMTPAddress; User = $delegate.primarySMTPAddress.ToString(); AccessRights = "SendOnBehalfTo"})
+                                            Else{
+                                                Write-LogEntry -LogName:$Script:LogFile -LogEntryText "Found permission : SendOnBehalfTo : $($deleg.primarySMTPAddress.ToString())"
+                                                $CollectPermissions.add([pscustomobject]@{Mailbox = $Mailbox.PrimarySMTPAddress; User = $deleg.primarySMTPAddress.ToString(); AccessRights = "SendOnBehalfTo"})
+                                            }
                                         }
                                     }
                                 }
@@ -593,7 +611,7 @@ Begin{
                 If((get-childitem $InputPermissionsFile).length -eq 0 ){
                     Write-LogEntry -LogName:$Script:LogFile -LogEntryText "The permissions file is empty. Check the log file for more info: $LogFile" -ForegroundColor Red
                     exit 
-                }
+                }
                 Write-LogEntry -LogName:$Script:LogFile -LogEntryText "Run function: Create-Batches" -ForegroundColor White 
     
                 $data = import-csv $InputPermissionsFile
@@ -650,8 +668,7 @@ Begin{
 	                Do{
 		                $checkForMatches = $false
 		                foreach($key in $($hashData.keys)){
-			                Write-Progress -Activity "Step 2 of 3: Analyze Delegates" -status "Items remaining: $($hashData.Count)" `
-    		                -percentComplete (($hashDataSize-$hashData.Count) / $hashDataSize*100)
+			                Write-Progress -Activity "Step 2 of 3: Analyze Delegates" -status "Items remaining: $($hashData.Count)" -percentComplete (($hashDataSize-$hashData.Count) / $hashDataSize*100)
 			
 	                        #Checks
 			                $usersHashData = $($hashData[$key]) | %{$_.mailbox}
@@ -725,8 +742,7 @@ Begin{
                     foreach($item in $usersFromBatch){
                         $usersFromBatchCounter++
                         $usersFromBatchRemaining = $usersFromBatch.count - $usersFromBatchCounter
-                        Write-Progress -Activity "Step 3 of 3: Creating migration schedule" -status "Items remaining: $($usersFromBatchRemaining)" `
-    		                -percentComplete (($usersFromBatchCounter / $usersFromBatch.count)*100)
+                        Write-Progress -Activity "Step 3 of 3: Creating migration schedule" -status "Items remaining: $($usersFromBatchRemaining)" -percentComplete (($usersFromBatchCounter / $usersFromBatch.count)*100)
 
                        #Check if using UseImportCSVFile and if yes, check if the user was part of that file, otherwise mark 
                        $isUserPartOfInitialCSVFile = ""
@@ -736,10 +752,11 @@ Begin{
                         }
                        }
 
-                       $user = get-user $item.user -erroraction SilentlyContinue
+                       $user = get-user $item.user #-erroraction SilentlyContinue
 		   
                        If(![string]::IsNullOrEmpty($user.WindowsEmailAddress)){
-			                $mbStats = Get-MailboxStatistics $user.WindowsEmailAddress.tostring() | select totalitemsize
+			             If($user.recipienttype -eq "UserMailbox"){ 
+                          $mbStats = Get-MailboxStatistics $user.WindowsEmailAddress.tostring() | select totalitemsize
 			                If($mbStats.totalitemsize.value)
                             {
                                 #if connecting through remote pshell, and not using Exo server shell, the data comes as 
@@ -759,6 +776,7 @@ Begin{
                             }
 
                            $userInfo.AppendLine(",,,$($user.WindowsEmailAddress),$($item.Batch),$($mailboxSize),$isUserPartOfInitialCSVFile") | Out-Null
+                         }
                        }
 		               Else{ #there was an error either getting the user from Get-User or the user doesn't have an email address
 					       $userInfo.AppendLine(",,,$($item.user),$($item.Batch),n/a,,User not found or doesn't have an email address") | Out-Null
@@ -795,7 +813,7 @@ Begin{
         $BatchesFile = "$scriptPath\Find-MailboxDelegates-Batches.csv"
         $MigrationScheduleFile = "$scriptPath\Find-MailboxDelegates-Schedule.csv"
         $ProgressXMLFile = "$scriptPath\Find-MailboxDelegates-Progress.xml"
-        $Version = "06262018"
+        $Version = "12062019"
         $computer = $env:COMPUTERNAME
         $user = $env:USERNAME
 
@@ -814,9 +832,13 @@ Begin{
             throw "Powershell V3+ is required. If you're running from Exchange Shell, it may be defaulting to PS2.0. Run 'powershell -version 3' and re-run the script."
         }
 
-        #Run only the batch users step if the switch BatchUsersOnly switch has been added 
-        If($BatchUsersOnly){
-            Write-LogEntry -LogName:$LogFile -LogEntryText "Running only Step #2: Batch Users" -ForegroundColor Yellow
+        #Run only the batch users step if the switch BatchUsersOnly switch has been added
+        If($BatchUsersOnly -and $GetPermissionsOnly){
+            Throw "Can't have both 'BatchUsersOnly' and 'GetPermissionsOnly' switches. Please use one or the other. "
+            exit   
+        }
+        ElseIf($BatchUsersOnly){
+            Write-LogEntry -LogName:$LogFile -LogEntryText "Running only Step #2: Batch Users..." -ForegroundColor Yellow
             Create-Batches -InputPermissionsFile $PermsOutputFile
             exit     
         }
@@ -836,8 +858,9 @@ Begin{
             ""
         }
         $exchserversession = get-pssession | ?{$_.configurationname -eq "Microsoft.Exchange"} | select -expandproperty computername 
-        $exchangeversion = get-exchangeserver $exchserversession | select -expandproperty AdminDisplayVersion
-        Write-LogEntry -LogName:$LogFile -LogEntryText "ExchangeServerName: $($exchserversession) ExchangeServerVersion: $($exchangeversion)" 
+        <#¤%&/Removed 2020-10-30
+		#$exchangeversion = get-exchangeserver $exchserversession | select -expandproperty AdminDisplayVersion
+        #Write-LogEntry -LogName:$LogFile -LogEntryText "ExchangeServerName: $($exchserversession) ExchangeServerVersion: $($exchangeversion)" 
         ""
 
         #Open connection to AD - this will be used to enumerate groups and collect Send As permissions
@@ -856,7 +879,7 @@ Begin{
             $permission = "Send As"
             $right = $ext.psbase.Children | ? { $_.DisplayName -eq $permission }
         }
-
+		#>
         #Check if re-running the script without resume. Clean outputs from previous run to prevent data corruption
         If((!$Resume) -and (test-path $PermsOutputFile) -and (!$BatchUsers) -and (!$BatchUsersOnly)){
             Write-LogEntry -LogName:$LogFile -LogEntryText "Clean up previous run to avoid mixed results" -ForegroundColor Yellow
@@ -864,7 +887,8 @@ Begin{
         }
 
         #Set scope to find objects in other domains
-        Set-AdServerSettings -ViewEntireForest $True
+        #¤%&/Removed 2020-10-30
+        #Set-AdServerSettings -ViewEntireForest $True
 
         #Used for Acccount/Resource models
         If($AccountResourceEnv){
@@ -981,15 +1005,28 @@ Begin{
 Process{
     ""
     If(!$BatchUsers){
-        Write-LogEntry -LogName:$LogFile -LogEntryText "STEP 1 of 3: Collect Permissions..." -ForegroundColor Yellow
-        If($Resume){Write-LogEntry -LogName:$LogFile -LogEntryText "Resume collect permissions based on xml file" -ForegroundColor White}
-        Write-LogEntry -LogName:$LogFile -LogEntryText "Mailbox count: $($ListOfMailboxes.Count)" -ForegroundColor White
-        $mailboxCounter = 0
-        Foreach($mailbox in $ListOfMailboxes.PrimarySMTPAddress){
-            $mailboxCounter++
-            Write-Progress -Activity "Step 1 of 3: Gathering Permissions" -status "Items processed: $($mailboxCounter) of $($ListOfMailboxes.Count)" `
-    		            -percentComplete (($mailboxCounter / $ListOfMailboxes.Count)*100)
-            Get-Permissions -UserEmail $mailbox -gatherfullaccess $FullAccess -gatherSendOnBehalfTo $SendOnBehalfTo -gathercalendar $Calendar -gathersendas $SendAs -EnumerateGroups $EnumerateGroups -ExcludedGroups $ExcludeGroups -ExcludedServiceAccts $ExcludeServiceAccts | export-csv -path $PermsOutputFile -notypeinformation -Append
+        If($GetPermissionsOnly){
+            Write-LogEntry -LogName:$LogFile -LogEntryText "Running Step #1 Only: Get Permissions..." -ForegroundColor Yellow
+            If($Resume){Write-LogEntry -LogName:$LogFile -LogEntryText "Resume collect permissions based on xml file" -ForegroundColor White}
+            Write-LogEntry -LogName:$LogFile -LogEntryText "Mailbox count: $($ListOfMailboxes.Count)" -ForegroundColor White
+            $mailboxCounter = 0
+            Foreach($mailbox in $ListOfMailboxes.PrimarySMTPAddress){
+                $mailboxCounter++
+                Write-Progress -Activity "Gathering Permissions" -status "Items processed: $($mailboxCounter) of $($ListOfMailboxes.Count)" -percentComplete (($mailboxCounter / $ListOfMailboxes.Count)*100)
+                Get-Permissions -UserEmail $mailbox -gatherfullaccess $FullAccess -gatherSendOnBehalfTo $SendOnBehalfTo -gathercalendar $Calendar -gathersendas $SendAs -EnumerateGroups $EnumerateGroups -ExcludedGroups $ExcludeGroups -ExcludedServiceAccts $ExcludeServiceAccts | export-csv -path $PermsOutputFile -notypeinformation -Append
+            }
+            exit
+        }
+        Else{
+            Write-LogEntry -LogName:$LogFile -LogEntryText "STEP 1 of 3: Collect Permissions..." -ForegroundColor Yellow
+            If($Resume){Write-LogEntry -LogName:$LogFile -LogEntryText "Resume collect permissions based on xml file" -ForegroundColor White}
+            Write-LogEntry -LogName:$LogFile -LogEntryText "Mailbox count: $($ListOfMailboxes.Count)" -ForegroundColor White
+            $mailboxCounter = 0
+            Foreach($mailbox in $ListOfMailboxes.PrimarySMTPAddress){
+                $mailboxCounter++
+                Write-Progress -Activity "Step 1 of 3: Gathering Permissions" -status "Items processed: $($mailboxCounter) of $($ListOfMailboxes.Count)" -percentComplete (($mailboxCounter / $ListOfMailboxes.Count)*100)
+                Get-Permissions -UserEmail $mailbox -gatherfullaccess $FullAccess -gatherSendOnBehalfTo $SendOnBehalfTo -gathercalendar $Calendar -gathersendas $SendAs -EnumerateGroups $EnumerateGroups -ExcludedGroups $ExcludeGroups -ExcludedServiceAccts $ExcludeServiceAccts | export-csv -path $PermsOutputFile -notypeinformation -Append
+            }
         }
     }
     ""
