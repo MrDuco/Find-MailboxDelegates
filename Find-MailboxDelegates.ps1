@@ -35,6 +35,7 @@ Steps performed by the script:
 
 =========================================
 Version: 
+    11032020: Modified for Tenant to Tenant migrations, removed untested switches.
     12062019: Add Permissions Only switch to skip steps 2 & 3
     08232019: AccountResourceEnv switch add 
     05012019: Update cross domain check
@@ -141,14 +142,14 @@ Switch to run the script taking into account an Account/Resource environment
 
 param(
     [string]$InputMailboxesCSV,
-    [switch]$FullAccess = $true,
-    [switch]$SendOnBehalfTo = $true,
-    [switch]$Calendar,
+    [switch]$FullAccess,
+    [switch]$SendOnBehalfTo,
+    #[switch]$Calendar,
     [switch]$SendAs,
-    [switch]$EnumerateGroups,
+    #[switch]$EnumerateGroups,
     [string]$ExcludeServiceAcctsCSV,
-    [string]$ExcludeGroupsCSV,
-    [string]$ExchServerFQDN,
+    #[string]$ExcludeGroupsCSV,
+    #[string]$ExchServerFQDN,
     [switch]$Resume,
     [switch]$BatchUsers, 
     [switch]$BatchUsersOnly,
